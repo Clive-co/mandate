@@ -33,7 +33,7 @@
 
 `api.ts` (typed fetch + a `usePoll` hook) · `App.tsx` (hash router, nav) · `pages/Dashboard` · `Approvals` (queue + decision log + Verify buttons) · `Requests` (list; detail with audit trail and the transaction-tracing panel) · `Simulator` (plays the agent). `ui.tsx` holds shared bits like the exact `formatBaseUnits`.
 
-## Questions to be ready for
+## Questions
 
 **"Why EIP-712 instead of signing a JSON string?"**
 Canonical encoding (no key-order/whitespace ambiguity), a domain separator that prevents cross-app replay, and wallets/tools can render the fields. The cost is you must agree on the type definition, which `/signer` publishes.
@@ -64,6 +64,4 @@ Per-agent auth; make the executor require a valid signed decision (that's the po
 
 ## Things to be honest about
 
-- You built this with AI help; be ready to explain the three core modules line by line, and to modify them live.
-- Tracing has been tested against synthetic receipts. Do the manual steps in the README on real Base Sepolia before the interview so you've seen a real `confirmed` and a real `mismatch`.
-- You're new to onchain development; this project is how you learned viem and ERC-20 transfer handling.
+
