@@ -1,7 +1,5 @@
 # Walkthrough: know every file
 
-Read these in order. The first three are the ones an interviewer will dig into.
-
 ## The three core modules (`server/src/`)
 
 **`policy.ts`: the decision.** One pure function, `evaluatePolicy(request, mandate, spentToday)`. No database, no clock, no network: that's *why* it's easy to test and why the tests are exhaustive. Two tiers: hard rules deny, soft rules escalate. `checkHardRules` reuses it when a human approves, so a human can't approve past a limit.
