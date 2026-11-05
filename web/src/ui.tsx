@@ -1,17 +1,19 @@
-import { useState, type ReactNode } from 'react';
-import { api } from './api';
-import type { Decision, Outcome, PaymentStatus } from './types';
+import type { ReactNode } from 'react';
+import type { MandateStatus, ReconStatus, Verdict } from './types';
 
-const LABELS: Record<Outcome | PaymentStatus, string> = {
-  approved: 'Approved',
-  denied: 'Denied',
-  needs_approval: 'Needs approval',
+const LABELS: Record<Verdict | ReconStatus | MandateStatus, string> = {
+  allow: 'Allowed',
+  deny: 'Denied',
   pending: 'Pending',
-  confirmed: 'Confirmed',
+  matched: 'Matched',
   mismatch: 'Mismatch',
+  active: 'Active',
+  expired: 'Expired',
+  revoked: 'Revoked',
+  replaced: 'Replaced',
 };
 
-export function Badge({ status }: { status: Outcome | PaymentStatus }) {
+export function Badge({ status }: { status: Verdict | ReconStatus | MandateStatus }) {
   return <span className={`badge badge-${status}`}>{LABELS[status]}</span>;
 }
 
@@ -32,20 +34,13 @@ export function Usdc({ value }: { value: string }) {
   );
 }
 
-/** Exact USDC base units -> decimal string, without floating point ("12500000" -> "12.5"). */
-export function formatBaseUnits(raw: string): string {
-  const padded = raw.padStart(7, '0');
-  const whole = padded.slice(0, -6);
-  const frac = padded.slice(-6).replace(/0+$/, '');
-  return frac ? `${whole}.${frac}` : whole;
-}
-
 export function timeAgo(ms: number, now = Date.now()): string {
-  const s = Math.max(0, Math.round((now - ms) / 1000));
-  if (s < 45) return 'just now';
-  if (s < 3600) return `${Math.round(s / 60)} min ago`;
-  if (s < 86400) return `${Math.round(s / 3600)} h ago`;
-  return `${Math.round(s / 86400)} d ago`;
+  const s = Math.round((now - ms) / 1000);
+  const abs = Math.abs(s);
+  const text =
+    abs < 45 ? 'a few seconds' : abs < 3600 ? `${Math.round(abs / 60)} min` : abs < 86400 ? `${Math.round(abs / 3600)} h` : `${Math.round(abs / 86400)} d`;
+  if (abs < 45) return s >= 0 ? 'just now' : 'in a moment';
+  return s >= 0 ? `${text} ago` : `in ${text}`;
 }
 
 export const fmtTime = (ms: number) => new Date(ms).toLocaleString();
@@ -56,6 +51,14 @@ export function Time({ ms }: { ms: number }) {
       {timeAgo(ms)}
     </time>
   );
+}
+
+/** Exact USDC base units -> decimal string, without floating point ("12500000" -> "12.5"). */
+export function formatBaseUnits(raw: string): string {
+  const padded = raw.padStart(7, '0');
+  const whole = padded.slice(0, -6);
+  const frac = padded.slice(-6).replace(/0+$/, '');
+  return frac ? `${whole}.${frac}` : whole;
 }
 
 export function Card({ title, aside, children }: { title?: string; aside?: ReactNode; children: ReactNode }) {
@@ -84,30 +87,22 @@ export function Empty({ children }: { children: ReactNode }) {
   return <p className="empty">{children}</p>;
 }
 
-/** Calls the server's /verify and shows whether the signature checks out. */
-export function VerifyButton({ decision }: { decision: Decision }) {
-  const [state, setState] = useState<'idle' | 'busy' | 'valid' | 'invalid' | 'error'>('idle');
-
-  async function run() {
-    setState('busy');
-    try {
-      const r = await api.verify(decision.message, decision.signature);
-      setState(r.valid ? 'valid' : 'invalid');
-    } catch {
-      setState('error');
-    }
+/** Decodes a JWT payload for DISPLAY ONLY. This does not verify anything: that is the seller's job. */
+export function decodeJwtPart(token: string, part: 0 | 1): Record<string, unknown> | null {
+  try {
+    const b64 = token.split('.')[part]!.replace(/-/g, '+').replace(/_/g, '/');
+    const json = decodeURIComponent(
+      atob(b64)
+        .split('')
+        .map((c) => `%${c.charCodeAt(0).toString(16).padStart(2, '0')}`)
+        .join(''),
+    );
+    return JSON.parse(json) as Record<string, unknown>;
+  } catch {
+    return null;
   }
-
-  if (state === 'valid') return <span className="verify verify-ok">✓ Signature valid</span>;
-  if (state === 'invalid') return <span className="verify verify-bad">✗ Invalid</span>;
-  if (state === 'error') return <span className="verify verify-bad">Could not verify</span>;
-  return (
-    <button type="button" className="btn btn-small" onClick={() => void run()} disabled={state === 'busy'}>
-      {state === 'busy' ? 'Verifying…' : 'Verify signature'}
-    </button>
-  );
 }
 
-export function shortSig(sig: string): string {
-  return `${sig.slice(0, 10)}…${sig.slice(-6)}`;
+export function shortToken(token: string): string {
+  return `${token.slice(0, 18)}…${token.slice(-10)}`;
 }

@@ -1,85 +1,93 @@
 import { mkdirSync } from 'node:fs';
-import { createRequire } from 'node:module';
-import { dirname } from 'node:path';
-import type { DatabaseSync } from 'node:sqlite';
+import { PGlite } from '@electric-sql/pglite';
+import pg from 'pg';
+import { SCHEMA } from './schema';
 
-// Node's built-in SQLite (no native addon to compile). It is loaded via createRequire because
-// Vite/Vitest's resolver doesn't recognise `node:sqlite` as a builtin and strips the prefix.
-const require = createRequire(import.meta.url);
-const { DatabaseSync: Database } = require('node:sqlite') as typeof import('node:sqlite');
+/**
+ * A deliberately tiny database interface, so the app runs on either:
+ *  - `pg` against a real Postgres server (DATABASE_URL), the production path; or
+ *  - PGlite, Postgres compiled to WebAssembly running in-process, for zero-setup dev and tests.
+ * Both speak the same SQL, so there is one set of queries.
+ */
+export type Row = Record<string, unknown>;
 
-export type Db = DatabaseSync;
+export interface Queryable {
+  query<T = Row>(sql: string, params?: unknown[]): Promise<T[]>;
+}
 
-const SCHEMA = `
-CREATE TABLE IF NOT EXISTS mandates (
-  agent_id           TEXT PRIMARY KEY,
-  name               TEXT NOT NULL,
-  per_payment_limit  TEXT NOT NULL,   -- USDC base units, decimal string
-  daily_limit        TEXT NOT NULL,
-  approval_threshold TEXT,
-  allowed_recipients TEXT NOT NULL,   -- JSON array of addresses
-  wallet_address     TEXT,
-  active             INTEGER NOT NULL DEFAULT 1
-);
+export interface Db extends Queryable {
+  readonly kind: 'pg' | 'pglite';
+  /** Run `fn` in one transaction: COMMIT if it resolves, ROLLBACK if it throws. */
+  transaction<T>(fn: (tx: Queryable) => Promise<T>): Promise<T>;
+  /** Run a multi-statement script (no parameters). */
+  exec(sql: string): Promise<void>;
+  close(): Promise<void>;
+}
 
--- agent_id is intentionally NOT a foreign key: a request from an unknown agent is still recorded
--- (as denied / no_mandate) so the audit trail has it.
-CREATE TABLE IF NOT EXISTS requests (
-  id         TEXT PRIMARY KEY,
-  agent_id   TEXT NOT NULL,
-  recipient  TEXT NOT NULL,
-  amount     TEXT NOT NULL,           -- USDC base units
-  memo       TEXT,
-  status     TEXT NOT NULL CHECK (status IN ('approved','denied','needs_approval')),
-  created_at INTEGER NOT NULL,        -- epoch ms
-  decided_at INTEGER                  -- epoch ms; null while needs_approval
-);
-CREATE INDEX IF NOT EXISTS idx_requests_agent_decided ON requests(agent_id, status, decided_at);
+export function connectPg(connectionString: string): Db {
+  const pool = new pg.Pool({ connectionString, max: 10 });
+  return {
+    kind: 'pg',
+    async query<T>(sql: string, params?: unknown[]) {
+      return (await pool.query(sql, params)).rows as T[];
+    },
+    async exec(sql) {
+      await pool.query(sql);
+    },
+    async transaction<T>(fn: (tx: Queryable) => Promise<T>) {
+      const client = await pool.connect();
+      try {
+        await client.query('BEGIN');
+        const result = await fn({
+          async query<R>(sql: string, params?: unknown[]) {
+            return (await client.query(sql, params)).rows as R[];
+          },
+        });
+        await client.query('COMMIT');
+        return result;
+      } catch (err) {
+        await client.query('ROLLBACK').catch(() => undefined);
+        throw err;
+      } finally {
+        client.release();
+      }
+    },
+    close: () => pool.end(),
+  };
+}
 
--- Every signed decision ever issued for a request (policy first, then maybe a human).
-CREATE TABLE IF NOT EXISTS decisions (
-  id         INTEGER PRIMARY KEY AUTOINCREMENT,
-  request_id TEXT NOT NULL REFERENCES requests(id),
-  outcome    TEXT NOT NULL,
-  decided_by TEXT NOT NULL,
-  reasons    TEXT NOT NULL,           -- JSON
-  message    TEXT NOT NULL,           -- JSON: the signed typed-data message (wire format)
-  signature  TEXT NOT NULL,
-  signer     TEXT NOT NULL,
-  created_at INTEGER NOT NULL
-);
+/** `dir` is a directory for persistent storage, or undefined / "memory://" for in-memory. */
+export async function connectPglite(dir?: string): Promise<Db> {
+  const inMemory = !dir || dir === 'memory://';
+  if (!inMemory) mkdirSync(dir, { recursive: true });
+  const db = await PGlite.create(inMemory ? undefined : dir);
+  return {
+    kind: 'pglite',
+    async query<T>(sql: string, params?: unknown[]) {
+      return (await db.query<T>(sql, params)).rows;
+    },
+    async exec(sql) {
+      await db.exec(sql);
+    },
+    async transaction<T>(fn: (tx: Queryable) => Promise<T>) {
+      return db.transaction(async (tx) =>
+        fn({
+          async query<R>(sql: string, params?: unknown[]) {
+            return (await tx.query<R>(sql, params)).rows;
+          },
+        }),
+      );
+    },
+    close: () => db.close(),
+  };
+}
 
--- One tracked payment per request. tx_hash is UNIQUE so one transaction can't "pay" two requests.
-CREATE TABLE IF NOT EXISTS payments (
-  request_id       TEXT PRIMARY KEY REFERENCES requests(id),
-  tx_hash          TEXT NOT NULL UNIQUE,
-  status           TEXT NOT NULL CHECK (status IN ('pending','confirmed','mismatch')),
-  block_number     TEXT,
-  reason           TEXT,
-  detail           TEXT,
-  actual_from      TEXT,
-  actual_recipient TEXT,
-  actual_amount    TEXT,
-  created_at       INTEGER NOT NULL,
-  checked_at       INTEGER
-);
+export async function migrate(db: Db): Promise<void> {
+  await db.exec(SCHEMA);
+}
 
--- Append-only audit trail, request -> decision(s) -> transaction.
-CREATE TABLE IF NOT EXISTS audit_events (
-  id         INTEGER PRIMARY KEY AUTOINCREMENT,
-  request_id TEXT NOT NULL REFERENCES requests(id),
-  type       TEXT NOT NULL,
-  detail     TEXT NOT NULL,           -- JSON
-  at         INTEGER NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_audit_request ON audit_events(request_id, id);
-`;
-
-export function openDb(path: string): Db {
-  if (path !== ':memory:') mkdirSync(dirname(path), { recursive: true });
-  const db = new Database(path);
-  db.exec('PRAGMA foreign_keys = ON');
-  if (path !== ':memory:') db.exec('PRAGMA journal_mode = WAL');
-  db.exec(SCHEMA);
-  return db;
+/** Postgres SQLSTATE of an error from either driver, e.g. "23505" for a unique violation. */
+export function sqlState(err: unknown): string | undefined {
+  const code = (err as { code?: unknown })?.code;
+  return typeof code === 'string' ? code : undefined;
 }

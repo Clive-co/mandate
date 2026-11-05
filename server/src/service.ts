@@ -1,10 +1,13 @@
 import { randomUUID } from 'node:crypto';
 import { getAddress, type Address, type Hash } from 'viem';
-import { checkHardRules, evaluatePolicy } from './policy';
-import { DecisionSigner, type DecisionMessage } from './signing';
-import type { DecisionRow, PaymentRow, RequestRow, Store } from './store';
-import { traceTransfer, type ReceiptClient, type TraceResult } from './tracing';
-import type { Mandate, Outcome, Reason } from './types';
+import { sqlState, type Db, type Queryable } from './db';
+import { evaluatePolicy } from './policy';
+import { reconcileTransfer, type ReceiptClient, type ReconcileResult } from './reconcile';
+import * as repo from './repo';
+import type { AgentStats, DecisionRow, DecisionWithPayment, ReconRow } from './repo';
+import type { KeyRing } from './keys';
+import { mandateStatus, type AuthorizeInput, type MandateRecord, type MandateStatus, type MandateTerms, type Verdict } from './types';
+import { signVerdict } from './verdict';
 import { utcDayStart } from './units';
 
 /** An error that maps cleanly onto an HTTP response. */
@@ -20,360 +23,370 @@ export class AppError extends Error {
 }
 
 export interface ServiceDeps {
-  store: Store;
-  signer: DecisionSigner;
+  db: Db;
+  keys: KeyRing;
   chain: ReceiptClient;
   /** USDC contract address on the target chain. */
   token: Address;
-  /** Injectable clock, so tests control "today". */
+  chainId: number;
+  /** The `iss` claim, and the base URL of the JWKS. */
+  issuer: string;
+  /** Injectable clock, so tests control "now". */
   now?: () => Date;
 }
 
-export interface SubmitInput {
-  agentId: string;
-  recipient: Address;
-  amount: bigint;
-  memo?: string | null;
+export interface TrailEvent {
+  at: Date;
+  type: 'authorization_requested' | 'verdict_issued' | 'reconciliation_pending' | 'reconciliation_matched' | 'reconciliation_mismatch';
+  detail: Record<string, unknown>;
 }
 
-export interface RequestDetail {
-  request: RequestRow;
-  mandate: Mandate | null;
-  decisions: DecisionRow[];
-  payment: PaymentRow | null;
-  events: ReturnType<Store['listEvents']>;
+export interface DecisionDetail {
+  decision: DecisionRow;
+  mandate: MandateRecord | null;
+  reconciliations: ReconRow[];
+  trail: TrailEvent[];
 }
 
 export interface AgentSummary {
-  mandate: Mandate;
-  spentToday: bigint;
-  pendingApprovals: number;
-  counts: Record<Outcome, number>;
-  confirmedOnchain: bigint;
-  mismatches: number;
-  pendingPayments: number;
+  mandate: MandateRecord;
+  status: MandateStatus;
+  allowedToday: bigint;
+  stats: AgentStats | null;
 }
 
 export class MandateService {
-  private readonly store: Store;
-  private readonly signer: DecisionSigner;
+  private readonly db: Db;
+  private readonly keys: KeyRing;
   private readonly chain: ReceiptClient;
-  private readonly token: Address;
+  readonly token: Address;
+  readonly chainId: number;
+  readonly issuer: string;
   private readonly now: () => Date;
 
   constructor(deps: ServiceDeps) {
-    this.store = deps.store;
-    this.signer = deps.signer;
+    this.db = deps.db;
+    this.keys = deps.keys;
     this.chain = deps.chain;
     this.token = deps.token;
+    this.chainId = deps.chainId;
+    this.issuer = deps.issuer;
     this.now = deps.now ?? (() => new Date());
   }
 
-  get signerAddress(): Address {
-    return this.signer.address;
+  /** The public keys served at /.well-known/jwks.json. */
+  jwks() {
+    return this.keys.jwks();
   }
 
-  // ---------------------------------------------------------------- mandates
+  // ================================================================ mandates
 
-  upsertMandate(m: Mandate): Mandate {
-    this.store.upsertMandate(m);
+  /** The first mandate for an agent (or a fresh one after the last was revoked or expired). */
+  async createMandate(agentId: string, terms: MandateTerms): Promise<MandateRecord> {
+    const now = this.now();
+    this.assertTerms(terms, now);
+    const id = randomUUID();
+    try {
+      await this.db.transaction(async (tx) => {
+        const current = await repo.currentMandate(tx, agentId, true);
+        if (current && mandateStatus(current, now) === 'active') {
+          throw new AppError(409, 'mandate_exists', `Agent already has an active mandate (v${current.version}); replace it instead`, {
+            mandateId: current.id,
+          });
+        }
+        await repo.insertMandate(tx, { id, agentId, version: (current?.version ?? 0) + 1, createdAt: now, ...terms });
+      });
+    } catch (err) {
+      throw conflict(err);
+    }
+    return (await this.requireMandate(id))!;
+  }
+
+  /**
+   * Revoke-and-replace. Mandates are never edited: this inserts the next version, and records a
+   * revocation of the old one that points at it, in ONE transaction. There is no moment where the
+   * agent has no mandate, or two.
+   */
+  async replaceMandate(id: string, terms: MandateTerms, reason: string): Promise<MandateRecord> {
+    const now = this.now();
+    this.assertTerms(terms, now);
+    const newId = randomUUID();
+    try {
+      await this.db.transaction(async (tx) => {
+        const old = await repo.getMandate(tx, id, true);
+        if (!old) throw new AppError(404, 'mandate_not_found', 'No such mandate');
+        if (old.revokedAt) throw new AppError(409, 'already_revoked', 'This mandate has already been revoked');
+        const current = await repo.currentMandate(tx, old.agentId);
+        if (current && current.id !== old.id) {
+          throw new AppError(409, 'not_current', `Only the current mandate (v${current.version}) can be replaced`);
+        }
+        await repo.insertMandate(tx, { id: newId, agentId: old.agentId, version: old.version + 1, createdAt: now, ...terms });
+        await repo.insertRevocation(tx, { mandateId: old.id, revokedAt: now, reason, replacedBy: newId });
+      });
+    } catch (err) {
+      throw conflict(err);
+    }
+    return (await this.requireMandate(newId))!;
+  }
+
+  /** Revoke without a replacement. The agent is denied (mandate_revoked) until a new mandate is created. */
+  async revokeMandate(id: string, reason: string): Promise<MandateRecord> {
+    const now = this.now();
+    try {
+      await this.db.transaction(async (tx) => {
+        const m = await repo.getMandate(tx, id, true);
+        if (!m) throw new AppError(404, 'mandate_not_found', 'No such mandate');
+        if (m.revokedAt) throw new AppError(409, 'already_revoked', 'This mandate has already been revoked');
+        await repo.insertRevocation(tx, { mandateId: id, revokedAt: now, reason, replacedBy: null });
+      });
+    } catch (err) {
+      throw conflict(err);
+    }
+    return (await this.requireMandate(id))!;
+  }
+
+  async getMandate(id: string): Promise<MandateRecord> {
+    return this.requireMandate(id);
+  }
+
+  listMandates(agentId?: string): Promise<MandateRecord[]> {
+    return repo.listMandates(this.db, agentId);
+  }
+
+  private async requireMandate(id: string): Promise<MandateRecord> {
+    const m = await repo.getMandate(this.db, id);
+    if (!m) throw new AppError(404, 'mandate_not_found', 'No such mandate');
     return m;
   }
 
-  // ---------------------------------------------------------------- requests
+  private assertTerms(t: MandateTerms, now: Date): void {
+    if (t.perTxLimit > t.dailyLimit) throw new AppError(400, 'invalid_mandate', 'perTxLimit cannot exceed dailyLimit');
+    if (t.expiresAt.getTime() <= now.getTime()) throw new AppError(400, 'invalid_mandate', 'expiresAt must be in the future');
+  }
+
+  // ================================================================ authorization
 
   /**
-   * An agent asks to spend. The policy check, the "spent today" read and the insert happen in
-   * ONE synchronous transaction, so two concurrent requests can't both slip under the daily
-   * limit. Signing is async, so it happens after: the request row (and its status) is already
-   * durable, and the signed decision is attached right after.
+   * Answer a spend request: evaluate it against the agent's current mandate, sign the verdict,
+   * and append it to the decision log, all in one transaction.
+   *
+   * Why that makes the daily limit race-proof: the agent's mandate row is locked (FOR UPDATE) for
+   * the whole transaction, so concurrent authorizations for one agent run one after another. Each
+   * then reads "spent today" AFTER the previous one committed, and the check and the insert can't
+   * be split by another request.
+   *
+   * Both outcomes are logged and both are signed: a deny verdict is evidence too. A verifier will
+   * refuse a deny verdict (`verdict_denied`).
    */
-  async submitRequest(input: SubmitInput): Promise<{ request: RequestRow; decision: DecisionRow }> {
+  async authorize(input: AuthorizeInput): Promise<DecisionRow> {
     const now = this.now();
     const id = randomUUID();
 
-    const { request, reasons } = this.store.transaction(() => {
-      const mandate = this.store.getMandate(input.agentId);
-      const spentToday = mandate ? this.store.approvedSpendSince(input.agentId, utcDayStart(now)) : 0n;
-      const result = evaluatePolicy({ amount: input.amount, recipient: input.recipient }, mandate, spentToday);
+    return this.db.transaction(async (tx) => {
+      const mandate = await repo.currentMandate(tx, input.agentId, true);
+      const spentToday = mandate ? await repo.allowedSpendSince(tx, input.agentId, new Date(utcDayStart(now))) : 0n;
+      const result = evaluatePolicy(input, mandate, spentToday, now);
 
-      const row: RequestRow = {
+      const signed = await signVerdict(
+        this.keys,
+        this.issuer,
+        {
+          id,
+          agentId: input.agentId,
+          verdict: result.verdict,
+          reasonCode: result.code,
+          amount: input.amount,
+          currency: input.currency,
+          recipient: input.recipient,
+          category: input.category,
+          chainId: this.chainId,
+          token: this.token,
+          mandateId: mandate?.id ?? null,
+          mandateVersion: mandate?.version ?? null,
+        },
+        now,
+      );
+
+      const row: Omit<DecisionRow, 'seq'> = {
         id,
         agentId: input.agentId,
-        recipient: input.recipient,
+        mandateId: mandate?.id ?? null,
+        mandateVersion: mandate?.version ?? null,
         amount: input.amount,
-        memo: input.memo ?? null,
-        status: result.outcome,
-        createdAt: now.getTime(),
-        decidedAt: result.outcome === 'needs_approval' ? null : now.getTime(),
+        currency: input.currency,
+        recipient: input.recipient,
+        category: input.category,
+        verdict: result.verdict,
+        reasonCode: result.code,
+        reason: result.reason,
+        nonce: signed.claims.nonce,
+        token: signed.token,
+        claims: signed.claims as unknown as Record<string, unknown>,
+        issuedAt: signed.issuedAt,
+        expiresAt: signed.expiresAt,
+        createdAt: now,
       };
-      this.store.insertRequest(row);
-      this.store.addEvent(
-        id,
-        'request_submitted',
-        { agentId: input.agentId, recipient: input.recipient, amount: input.amount.toString(), memo: row.memo },
-        now.getTime(),
-      );
-      return { request: row, reasons: result.reasons };
+      await repo.insertDecision(tx, row);
+      return { ...row, seq: 0 };
     });
-
-    const decision = await this.signAndRecord(request, request.status, 'policy', reasons);
-    return { request, decision };
   }
 
-  /**
-   * A human approves or rejects a queued request.
-   * Approving re-checks the HARD rules against today's spend: a human can approve an unknown
-   * recipient, but cannot approve their way past a per-payment or daily limit.
-   */
-  async resolveRequest(
-    requestId: string,
-    action: 'approve' | 'reject',
-    actor: string,
-  ): Promise<{ request: RequestRow; decision: DecisionRow }> {
-    const now = this.now();
-
-    const { request, reasons } = this.store.transaction(() => {
-      const existing = this.store.getRequest(requestId);
-      if (!existing) throw new AppError(404, 'request_not_found', 'No such request');
-      if (existing.status !== 'needs_approval') {
-        throw new AppError(409, 'not_pending', `Request is already ${existing.status}`);
-      }
-
-      let outcome: Outcome = 'denied';
-      let reasons: Reason[] = [{ code: 'rejected_by_human', message: `Rejected by ${actor}` }];
-
-      if (action === 'approve') {
-        const mandate = this.store.getMandate(existing.agentId);
-        const spentToday = this.store.approvedSpendSince(existing.agentId, utcDayStart(now));
-        const violations = checkHardRules(
-          { amount: existing.amount, recipient: existing.recipient },
-          mandate,
-          spentToday,
-        );
-        if (violations.length > 0) {
-          throw new AppError(
-            409,
-            'hard_rule_violation',
-            'This request now breaks a hard limit and cannot be approved. You can still reject it.',
-            violations,
-          );
-        }
-        outcome = 'approved';
-        reasons = [];
-      }
-
-      this.store.setRequestStatus(requestId, outcome, now.getTime());
-      this.store.addEvent(requestId, 'human_resolved', { action, actor }, now.getTime());
-      return { request: { ...existing, status: outcome, decidedAt: now.getTime() }, reasons };
-    });
-
-    const decision = await this.signAndRecord(request, request.status, `human:${actor}`, reasons);
-    return { request, decision };
+  listDecisions(filter: { verdict?: Verdict; agentId?: string; limit?: number } = {}): Promise<DecisionWithPayment[]> {
+    return repo.listDecisions(this.db, filter);
   }
 
-  private async signAndRecord(
-    request: RequestRow,
-    outcome: Outcome,
-    decidedBy: string,
-    reasons: Reason[],
-  ): Promise<DecisionRow> {
-    const now = this.now();
-    const message: DecisionMessage = {
-      requestId: request.id,
-      agentId: request.agentId,
-      token: this.token,
-      recipient: request.recipient,
-      amount: request.amount,
-      outcome,
-      decidedBy,
-      issuedAt: BigInt(Math.floor(now.getTime() / 1000)),
-    };
-    const signed = await this.signer.sign(message);
+  /** One decision with its mandate, every reconciliation attempt, and a request-to-transaction trail. */
+  async getDecisionDetail(id: string): Promise<DecisionDetail> {
+    const decision = await this.requireDecision(id);
+    const [mandate, reconciliations] = await Promise.all([
+      decision.mandateId ? repo.getMandate(this.db, decision.mandateId) : Promise.resolve(null),
+      repo.listRecons(this.db, id),
+    ]);
 
-    const row: Omit<DecisionRow, 'id'> = {
-      requestId: request.id,
-      outcome,
-      decidedBy,
-      reasons,
-      message: signed.message,
-      signature: signed.signature,
-      signer: signed.signer,
-      createdAt: now.getTime(),
-    };
-    this.store.transaction(() => {
-      this.store.insertDecision(row);
-      this.store.addEvent(request.id, 'decision_signed', { outcome, decidedBy, reasons }, now.getTime());
-    });
-    const saved = this.store.listDecisions(request.id).at(-1);
-    if (!saved) throw new Error('decision was not persisted');
-    return saved;
+    const trail: TrailEvent[] = [
+      {
+        at: decision.createdAt,
+        type: 'authorization_requested',
+        detail: {
+          agentId: decision.agentId,
+          amount: decision.amount.toString(),
+          currency: decision.currency,
+          recipient: decision.recipient,
+          category: decision.category,
+        },
+      },
+      {
+        at: decision.createdAt,
+        type: 'verdict_issued',
+        detail: {
+          verdict: decision.verdict,
+          reasonCode: decision.reasonCode,
+          reason: decision.reason,
+          mandateVersion: decision.mandateVersion,
+          expiresAt: decision.expiresAt.toISOString(),
+        },
+      },
+      ...reconciliations.map(
+        (r): TrailEvent => ({
+          at: r.createdAt,
+          type: `reconciliation_${r.status}`,
+          detail: { txHash: r.txHash, reason: r.reason, detail: r.detail, blockNumber: r.blockNumber?.toString() ?? null },
+        }),
+      ),
+    ];
+    return { decision, mandate, reconciliations, trail };
   }
 
-  listRequests(filter: { status?: Outcome; agentId?: string } = {}): Array<{
-    request: RequestRow;
-    payment: PaymentRow | null;
-  }> {
-    return this.store.listRequests(filter).map((request) => ({
-      request,
-      payment: this.store.getPayment(request.id),
-    }));
+  private async requireDecision(id: string): Promise<DecisionRow> {
+    const d = await repo.getDecision(this.db, id);
+    if (!d) throw new AppError(404, 'decision_not_found', 'No such decision');
+    return d;
   }
 
-  getRequestDetail(id: string): RequestDetail {
-    const request = this.store.getRequest(id);
-    if (!request) throw new AppError(404, 'request_not_found', 'No such request');
-    return {
-      request,
-      mandate: this.store.getMandate(request.agentId),
-      decisions: this.store.listDecisions(id),
-      payment: this.store.getPayment(id),
-      events: this.store.listEvents(id),
-    };
+  // ================================================================ onchain reconciliation
+
+  /** Attach a Base Sepolia transaction hash to an ALLOWED decision and compare it to the verdict. */
+  async attachPayment(decisionId: string, txHash: Hash): Promise<ReconRow> {
+    return this.reconcile(decisionId, txHash.toLowerCase() as Hash);
   }
 
-  recentDecisions(limit = 50): DecisionRow[] {
-    return this.store.listRecentDecisions(limit);
+  /** Run the check again against the transaction already attached (e.g. it was still pending). */
+  async recheckPayment(decisionId: string): Promise<ReconRow> {
+    await this.requireDecision(decisionId);
+    const latest = (await repo.listRecons(this.db, decisionId)).at(-1);
+    if (!latest) throw new AppError(404, 'no_payment', 'No transaction has been attached to this decision');
+    if (latest.status === 'matched') return latest;
+    return this.reconcile(decisionId, latest.txHash);
   }
 
-  // ---------------------------------------------------------------- onchain tracing
-
-  /** Attach a transaction hash to an approved request and check it against the chain. */
-  async attachPayment(requestId: string, txHash: Hash): Promise<PaymentRow> {
-    const request = this.requireApproved(requestId);
-    const normalized = txHash.toLowerCase() as Hash;
-
-    const existing = this.store.getPayment(requestId);
-    if (existing?.status === 'confirmed') {
-      throw new AppError(409, 'already_confirmed', 'This request already has a confirmed payment');
+  private async reconcile(decisionId: string, txHash: Hash): Promise<ReconRow> {
+    const decision = await this.requireDecision(decisionId);
+    if (decision.verdict !== 'allow') {
+      throw new AppError(409, 'not_allowed', 'Only allowed decisions can be paid, so there is nothing to reconcile');
     }
-    this.assertTxUnused(normalized, requestId);
+    await this.assertPayable(decisionId, txHash);
 
-    const trace = await this.trace(request, normalized);
-
-    return this.store.transaction(() => {
-      // Re-check inside the transaction: another request may have claimed the hash while we awaited RPC.
-      this.assertTxUnused(normalized, requestId);
-      const now = this.now().getTime();
-      const payment = toPayment(requestId, normalized, trace, existing?.createdAt ?? now, now);
-      this.store.savePayment(payment);
-      this.store.addEvent(requestId, 'payment_submitted', { txHash: normalized }, now);
-      this.store.addEvent(requestId, `payment_${trace.status}`, eventDetail(trace), now);
-      return payment;
-    });
-  }
-
-  /** Re-run the onchain check for a payment that is still pending (or mismatched, e.g. after a reorg). */
-  async recheckPayment(requestId: string): Promise<PaymentRow> {
-    const request = this.requireApproved(requestId);
-    const existing = this.store.getPayment(requestId);
-    if (!existing) throw new AppError(404, 'no_payment', 'No transaction has been attached to this request');
-    if (existing.status === 'confirmed') return existing;
-
-    const trace = await this.trace(request, existing.txHash);
-    const now = this.now().getTime();
-    const payment = toPayment(requestId, existing.txHash, trace, existing.createdAt, now);
-    this.store.transaction(() => {
-      this.store.savePayment(payment);
-      if (trace.status !== existing.status) {
-        this.store.addEvent(requestId, `payment_${trace.status}`, eventDetail(trace), now);
-      }
-    });
-    return payment;
-  }
-
-  private requireApproved(requestId: string): RequestRow {
-    const request = this.store.getRequest(requestId);
-    if (!request) throw new AppError(404, 'request_not_found', 'No such request');
-    if (request.status !== 'approved') {
-      throw new AppError(409, 'not_approved', `Only approved requests can be paid (this one is ${request.status})`);
-    }
-    return request;
-  }
-
-  private assertTxUnused(txHash: Hash, requestId: string): void {
-    const owner = this.store.getPaymentByTx(txHash);
-    if (owner && owner.requestId !== requestId) {
-      throw new AppError(409, 'tx_already_used', `That transaction is already attached to request ${owner.requestId}`);
-    }
-  }
-
-  private async trace(request: RequestRow, txHash: Hash): Promise<TraceResult> {
-    const mandate = this.store.getMandate(request.agentId);
+    const mandate = decision.mandateId ? await repo.getMandate(this.db, decision.mandateId) : null;
+    let result: ReconcileResult;
     try {
-      return await traceTransfer(this.chain, txHash, {
-        token: this.token,
-        recipient: request.recipient,
-        amount: request.amount,
-        from: mandate?.walletAddress ?? null,
+      // The VERDICT is the source of truth: its token, recipient and amount, not whatever the mandate says now.
+      result = await reconcileTransfer(this.chain, txHash, {
+        token: decision.claims.token as Address,
+        recipient: decision.recipient,
+        amount: decision.amount,
+        from: mandate?.payerAddress ?? null,
       });
     } catch (err) {
       throw new AppError(502, 'rpc_error', `Could not read the chain: ${(err as Error).message}`);
     }
-  }
 
-  // ---------------------------------------------------------------- dashboard
-
-  agentSummaries(): AgentSummary[] {
-    const since = utcDayStart(this.now());
-    const payments = new Map(this.store.listPayments().map((p) => [p.requestId, p]));
-    const all = this.store.listRequests();
-
-    return this.store.listMandates().map((mandate) => {
-      const mine = all.filter((r) => r.agentId === mandate.agentId);
-      const counts: Record<Outcome, number> = { approved: 0, denied: 0, needs_approval: 0 };
-      let confirmedOnchain = 0n;
-      let mismatches = 0;
-      let pendingPayments = 0;
-      for (const r of mine) {
-        counts[r.status] += 1;
-        const p = payments.get(r.id);
-        if (p?.status === 'confirmed') confirmedOnchain += r.amount;
-        if (p?.status === 'mismatch') mismatches += 1;
-        if (p?.status === 'pending') pendingPayments += 1;
+    try {
+      await this.db.transaction(async (tx) => {
+        // The chain read took a while: re-check inside the transaction that nobody matched meanwhile.
+        await this.assertPayable(decisionId, txHash, tx);
+        await repo.insertRecon(tx, {
+          decisionId,
+          txHash,
+          status: result.status,
+          reason: result.reason,
+          detail: result.detail,
+          blockNumber: result.blockNumber,
+          actualFrom: result.actual?.from ?? null,
+          actualRecipient: result.actual?.to ?? null,
+          actualAmount: result.actual?.amount ?? null,
+          createdAt: this.now(),
+        });
+      });
+    } catch (err) {
+      // The partial unique indexes are the backstop if two requests race past the checks above.
+      if (sqlState(err) === '23505') {
+        throw new AppError(409, 'tx_already_used', 'That transaction has already been matched to a payment');
       }
-      return {
-        mandate,
-        spentToday: this.store.approvedSpendSince(mandate.agentId, since),
-        pendingApprovals: counts.needs_approval,
-        counts,
-        confirmedOnchain,
-        mismatches,
-        pendingPayments,
-      };
-    });
+      throw err;
+    }
+    return (await repo.listRecons(this.db, decisionId)).at(-1)!;
+  }
+
+  private async assertPayable(decisionId: string, txHash: Hash, q: Queryable = this.db): Promise<void> {
+    const recons = await repo.listRecons(q, decisionId);
+    if (recons.some((r) => r.status === 'matched')) {
+      throw new AppError(409, 'already_matched', 'This decision already has a matched payment');
+    }
+    const owner = await repo.matchedDecisionForTx(q, txHash);
+    if (owner && owner !== decisionId) {
+      throw new AppError(409, 'tx_already_used', `That transaction is already matched to decision ${owner}`);
+    }
+  }
+
+  // ================================================================ dashboard
+
+  async summary(): Promise<AgentSummary[]> {
+    const now = this.now();
+    const since = new Date(utcDayStart(now));
+    const [mandates, stats] = await Promise.all([repo.listMandates(this.db), repo.agentStats(this.db, since)]);
+    const byAgent = new Map(stats.map((s) => [s.agentId, s]));
+
+    const current = new Map<string, MandateRecord>();
+    for (const m of mandates) {
+      const seen = current.get(m.agentId);
+      if (!seen || m.version > seen.version) current.set(m.agentId, m);
+    }
+    return [...current.values()].map((mandate) => ({
+      mandate,
+      status: mandateStatus(mandate, now),
+      allowedToday: byAgent.get(mandate.agentId)?.allowedToday ?? 0n,
+      stats: byAgent.get(mandate.agentId) ?? null,
+    }));
   }
 }
 
-function toPayment(
-  requestId: string,
-  txHash: Hash,
-  trace: TraceResult,
-  createdAt: number,
-  checkedAt: number,
-): PaymentRow {
-  return {
-    requestId,
-    txHash,
-    status: trace.status,
-    blockNumber: trace.blockNumber === null ? null : trace.blockNumber.toString(),
-    reason: trace.reason,
-    detail: trace.detail,
-    actualFrom: trace.actual?.from ?? null,
-    actualRecipient: trace.actual?.to ?? null,
-    actualAmount: trace.actual?.amount ?? null,
-    createdAt,
-    checkedAt,
-  };
-}
-
-function eventDetail(trace: TraceResult) {
-  return {
-    status: trace.status,
-    reason: trace.reason,
-    detail: trace.detail,
-    blockNumber: trace.blockNumber === null ? null : trace.blockNumber.toString(),
-  };
+/** Turn a unique-constraint violation (two writers raced) into a clean 409. */
+function conflict(err: unknown): unknown {
+  if (err instanceof AppError) return err;
+  if (sqlState(err) === '23505') {
+    return new AppError(409, 'conflict', 'The mandate was changed by someone else at the same time; reload and try again');
+  }
+  return err;
 }
 
 /** Normalise user-supplied addresses to EIP-55 checksum form. Throws on invalid input. */

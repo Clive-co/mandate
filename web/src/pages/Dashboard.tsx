@@ -12,68 +12,71 @@ function Tile({ label, value, tone, hint }: { label: string; value: string; tone
   );
 }
 
-function AgentCard({ a, onOpen }: { a: AgentSummary; onOpen: () => void }) {
-  const spent = Number(a.spentTodayUsdc);
-  const limit = Number(a.dailyLimitUsdc);
+function AgentCard({ a, go }: { a: AgentSummary; go: (path: string) => void }) {
+  const spent = Number(a.allowedTodayUsdc);
+  const limit = Number(a.mandate.dailyLimitUsdc);
   const pct = limit > 0 ? Math.min(100, (spent / limit) * 100) : 0;
+  const m = a.mandate;
 
   return (
-    <article className={`agent${a.active ? '' : ' agent-paused'}`}>
+    <article className={`agent${m.status === 'active' ? '' : ' agent-paused'}`}>
       <header className="agent-head">
         <div>
-          <h3>{a.name}</h3>
-          <code className="mono muted">{a.agentId}</code>
+          <h3>{a.agentId}</h3>
+          <span className="muted small">
+            Mandate v{m.version} · {m.categories.join(', ')}
+          </span>
         </div>
-        {!a.active && <span className="badge badge-denied">Paused</span>}
-        {a.pendingApprovals > 0 && (
-          <button type="button" className="chip chip-warn" onClick={onOpen}>
-            {a.pendingApprovals} waiting
-          </button>
-        )}
+        <Badge status={m.status} />
       </header>
 
-      <div className="meter" aria-label={`Spent ${a.spentTodayUsdc} of ${a.dailyLimitUsdc} USDC today`}>
+      <div className="meter" aria-label={`Allowed ${a.allowedTodayUsdc} of ${m.dailyLimitUsdc} USDC today`}>
         <div className="meter-fill" style={{ width: `${pct}%` }} data-high={pct >= 85} />
       </div>
       <div className="meter-caption">
         <span>
-          <strong className="num">{a.spentTodayUsdc}</strong> of <span className="num">{a.dailyLimitUsdc}</span> USDC today
+          <strong className="num">{a.allowedTodayUsdc}</strong> of <span className="num">{m.dailyLimitUsdc}</span> USDC today
         </span>
         <span className="muted num">{a.remainingTodayUsdc} left</span>
       </div>
 
       <dl className="facts">
         <div>
-          <dt>Per payment</dt>
-          <dd className="num">≤ {a.perPaymentLimitUsdc}</dd>
+          <dt>Per transaction</dt>
+          <dd className="num">≤ {m.perTxLimitUsdc}</dd>
         </div>
         <div>
-          <dt>Auto-approve up to</dt>
-          <dd className="num">{a.approvalThresholdUsdc ?? 'no cap'}</dd>
+          <dt>Expires</dt>
+          <dd>
+            <Time ms={m.expiresAt} />
+          </dd>
         </div>
         <div>
-          <dt>Allowlist</dt>
-          <dd className="num">{a.allowedRecipients.length}</dd>
+          <dt>Recipients</dt>
+          <dd>{m.allowedRecipients ? m.allowedRecipients.length : 'any'}</dd>
         </div>
       </dl>
 
       <div className="agent-foot">
         <span>
-          <span className="dot dot-approved" /> {a.requestCounts.approved} approved
+          <span className="dot dot-allow" /> {a.allowCount} allowed
         </span>
         <span>
-          <span className="dot dot-needs_approval" /> {a.requestCounts.needs_approval} queued
+          <span className="dot dot-deny" /> {a.denyCount} denied
         </span>
         <span>
-          <span className="dot dot-denied" /> {a.requestCounts.denied} denied
+          <span className="dot dot-pending" /> {a.awaitingPaymentCount} awaiting payment
         </span>
       </div>
       <div className="agent-chain">
         <span>
-          Onchain: <strong className="num">{a.confirmedOnchainUsdc}</strong> USDC confirmed
+          Matched onchain: <strong className="num">{a.matchedUsdc}</strong> USDC
         </span>
-        {a.pendingPayments > 0 && <span className="muted"> · {a.pendingPayments} awaiting receipt</span>}
-        {a.mismatches > 0 && <span className="text-bad"> · {a.mismatches} mismatch</span>}
+        {a.pendingCount > 0 && <span className="muted"> · {a.pendingCount} pending</span>}
+        {a.mismatchCount > 0 && <span className="text-bad"> · {a.mismatchCount} mismatch</span>}
+        <button type="button" className="link link-right" onClick={() => go('/mandates')}>
+          Mandates →
+        </button>
       </div>
     </article>
   );
@@ -81,8 +84,7 @@ function AgentCard({ a, onOpen }: { a: AgentSummary; onOpen: () => void }) {
 
 export function Dashboard({ go }: { go: (path: string) => void }) {
   const summary = usePoll(api.summary, 'summary');
-  const recent = usePoll(() => api.requests(), 'requests-all');
-
+  const recent = usePoll(() => api.decisions({ limit: 10 }), 'decisions-recent');
   const t = summary.data?.totals;
 
   return (
@@ -90,41 +92,40 @@ export function Dashboard({ go }: { go: (path: string) => void }) {
       <ErrorNote message={summary.error ?? recent.error} />
 
       <div className="tiles">
+        <Tile label="Allowed today (UTC)" value={t ? `${t.allowedTodayUsdc} USDC` : '–'} hint={t ? `${t.allowCount} allowed · ${t.denyCount} denied, all time` : undefined} />
         <Tile
-          label="Waiting on a human"
-          value={String(t?.pendingApprovals ?? '–')}
-          tone={t && t.pendingApprovals > 0 ? 'warn' : undefined}
+          label="Awaiting payment"
+          value={String(t?.awaitingPaymentCount ?? '–')}
+          tone={t && t.awaitingPaymentCount > 0 ? 'warn' : undefined}
+          hint="Allowed, no matching transfer yet"
         />
-        <Tile label="Approved spend today (UTC)" value={t ? `${t.spentTodayUsdc} USDC` : '–'} />
-        <Tile label="Confirmed onchain" value={t ? `${t.confirmedOnchainUsdc} USDC` : '–'} hint="Matched to a Base Sepolia transfer" />
+        <Tile label="Matched onchain" value={t ? `${t.matchedUsdc} USDC` : '–'} hint="Verified against a Base Sepolia transfer" />
         <Tile
           label="Mismatches"
-          value={String(t?.mismatches ?? '–')}
-          tone={t && t.mismatches > 0 ? 'bad' : undefined}
-          hint={t && t.pendingPayments > 0 ? `${t.pendingPayments} awaiting receipt` : undefined}
+          value={String(t?.mismatchCount ?? '–')}
+          tone={t && t.mismatchCount > 0 ? 'bad' : undefined}
+          hint={t && t.pendingCount > 0 ? `${t.pendingCount} pending receipt` : undefined}
         />
       </div>
 
-      <Card title="Agents">
-        {summary.data && summary.data.agents.length === 0 && (
-          <Empty>No agents yet. Run `npm run seed` or create a mandate with PUT /mandates/:agentId.</Empty>
-        )}
+      <Card title="Spend per agent">
+        {summary.data && summary.data.agents.length === 0 && <Empty>No agents yet. Run `npm run seed`, or create a mandate on the Mandates page.</Empty>}
         <div className="agents">
           {summary.data?.agents.map((a) => (
-            <AgentCard key={a.agentId} a={a} onOpen={() => go('/approvals')} />
+            <AgentCard key={a.agentId} a={a} go={go} />
           ))}
         </div>
       </Card>
 
       <Card
-        title="Recent requests"
+        title="Recent approvals"
         aside={
-          <button type="button" className="link" onClick={() => go('/requests')}>
+          <button type="button" className="link" onClick={() => go('/decisions')}>
             View all
           </button>
         }
       >
-        {recent.data && recent.data.length === 0 && <Empty>No requests yet. Try the Simulator tab.</Empty>}
+        {recent.data && recent.data.length === 0 && <Empty>No authorizations yet. Try the Simulator.</Empty>}
         {recent.data && recent.data.length > 0 && (
           <div className="table-wrap">
             <table>
@@ -134,27 +135,29 @@ export function Dashboard({ go }: { go: (path: string) => void }) {
                   <th>Agent</th>
                   <th className="right">Amount</th>
                   <th>Recipient</th>
-                  <th>Decision</th>
+                  <th>Category</th>
+                  <th>Verdict</th>
                   <th>Onchain</th>
                 </tr>
               </thead>
               <tbody>
-                {recent.data.slice(0, 8).map((r) => (
-                  <tr key={r.id} className="clickable" onClick={() => go(`/requests/${r.id}`)}>
+                {recent.data.map((d) => (
+                  <tr key={d.id} className="clickable" onClick={() => go(`/decisions/${d.id}`)}>
                     <td>
-                      <Time ms={r.createdAt} />
+                      <Time ms={d.createdAt} />
                     </td>
-                    <td>{r.agentId}</td>
+                    <td>{d.agentId}</td>
                     <td className="right">
-                      <Usdc value={r.amountUsdc} />
+                      <Usdc value={d.amountUsdc} />
                     </td>
                     <td>
-                      <Addr value={r.recipient} />
+                      <Addr value={d.recipient} />
                     </td>
+                    <td>{d.category}</td>
                     <td>
-                      <Badge status={r.status} />
+                      <Badge status={d.verdict} />
                     </td>
-                    <td>{r.payment ? <Badge status={r.payment.status} /> : <span className="muted">–</span>}</td>
+                    <td>{d.payment ? <Badge status={d.payment.status} /> : <span className="muted">{d.verdict === 'allow' ? 'unpaid' : '–'}</span>}</td>
                   </tr>
                 ))}
               </tbody>

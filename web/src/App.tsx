@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useState } from 'react';
 import { api, usePoll } from './api';
-import { Approvals } from './pages/Approvals';
 import { Dashboard } from './pages/Dashboard';
-import { RequestDetailView, Requests } from './pages/Requests';
+import { DecisionDetailView, Decisions } from './pages/Decisions';
+import { Mandates } from './pages/Mandates';
 import { Simulator } from './pages/Simulator';
 
 /** Tiny hash router: "#/requests/abc" -> "/requests/abc". No dependency needed for four pages. */
@@ -26,23 +26,23 @@ function useHashRoute(): [string, (path: string) => void] {
 
 const NAV = [
   { path: '/', label: 'Dashboard' },
-  { path: '/approvals', label: 'Approvals' },
-  { path: '/requests', label: 'Requests' },
+  { path: '/decisions', label: 'Decisions' },
+  { path: '/mandates', label: 'Mandates' },
   { path: '/simulator', label: 'Simulator' },
 ] as const;
 
 export function App() {
   const [path, go] = useHashRoute();
   const summary = usePoll(api.summary, 'summary-nav', 8000);
-  const pending = summary.data?.totals.pendingApprovals ?? 0;
+  const awaiting = summary.data?.totals.awaitingPaymentCount ?? 0;
 
-  const detailId = path.startsWith('/requests/') ? path.slice('/requests/'.length) : null;
-  const section = detailId ? '/requests' : path;
+  const detailId = path.startsWith('/decisions/') ? path.slice('/decisions/'.length) : null;
+  const section = detailId ? '/decisions' : path;
 
   let page;
-  if (detailId) page = <RequestDetailView key={detailId} id={detailId} go={go} />;
-  else if (path === '/approvals') page = <Approvals go={go} />;
-  else if (path === '/requests') page = <Requests go={go} />;
+  if (detailId) page = <DecisionDetailView key={detailId} id={detailId} go={go} />;
+  else if (path === '/decisions') page = <Decisions go={go} />;
+  else if (path === '/mandates') page = <Mandates />;
   else if (path === '/simulator') page = <Simulator go={go} />;
   else page = <Dashboard go={go} />;
 
@@ -63,7 +63,7 @@ export function App() {
                 aria-current={section === n.path ? 'page' : undefined}
               >
                 {n.label}
-                {n.path === '/approvals' && pending > 0 && <span className="count">{pending}</span>}
+                {n.path === '/decisions' && awaiting > 0 && <span className="count" title="Allowed, awaiting payment">{awaiting}</span>}
               </a>
             ))}
           </nav>
@@ -76,7 +76,7 @@ export function App() {
       <main className="page">{page}</main>
 
       <footer className="footer">
-        Testnet learning project: agent spend approvals with onchain USDC receipts. Not a production system; no real funds.
+        Testnet learning project: signed spend verdicts reconciled against onchain USDC transfers. Not a production system; no real funds.
       </footer>
     </>
   );

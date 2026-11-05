@@ -1,95 +1,91 @@
 import cors from '@fastify/cors';
 import Fastify, { type FastifyInstance } from 'fastify';
-import { isAddress, isHash } from 'viem';
+import { createLocalJWKSet } from 'jose';
+import { isAddress, isHash, type Hash } from 'viem';
 import { z, ZodError } from 'zod';
-import {
-  apiAgentSummary,
-  apiDecision,
-  apiDetail,
-  apiMandate,
-  apiPayment,
-  apiRequest,
-} from './serialize';
+import { apiDecision, apiDecisionListItem, apiDetail, apiMandate, apiRecon, apiSummary } from './serialize';
 import { AppError, MandateService, normalizeAddress } from './service';
-import { DECISION_DOMAIN, DECISION_TYPES, fromWire, verifyDecision } from './signing';
-import { parseUsdc, formatUsdc } from './units';
-import type { Hash, Hex } from 'viem';
+import { CURRENCY, type MandateTerms } from './types';
+import { parseUsdc } from './units';
+import { InMemoryNonceStore, verifyVerdict, type NonceStore } from './verifier';
+
+// ---------------------------------------------------------------- input schemas
+
+const MAX_BASE_UNITS = 2n ** 128n - 1n;
 
 const address = z
   .string()
   .refine((v) => isAddress(v, { strict: false }), 'must be a valid 0x address')
   .transform((v) => normalizeAddress(v.toLowerCase()));
 
-const usdcAmount = z
-  .string()
-  .transform((v, ctx) => {
-    try {
-      return parseUsdc(v);
-    } catch (e) {
-      ctx.addIssue({ code: 'custom', message: (e as Error).message });
-      return z.NEVER;
-    }
-  });
+/** A decimal USDC string such as "12.5" (at most 6 places) -> base units as bigint. */
+const usdcAmount = z.string().transform((v, ctx) => {
+  try {
+    const n = parseUsdc(v);
+    if (n > MAX_BASE_UNITS) throw new Error('amount is too large');
+    return n;
+  } catch (e) {
+    ctx.addIssue({ code: 'custom', message: (e as Error).message });
+    return z.NEVER;
+  }
+});
 
 const agentId = z.string().min(1).max(64).regex(/^[a-zA-Z0-9_.-]+$/, 'letters, digits, _ . - only');
+const category = z
+  .string()
+  .transform((v) => v.trim().toLowerCase())
+  .pipe(z.string().regex(/^[a-z0-9][a-z0-9_-]{0,31}$/, 'lowercase letters, digits, _ - (max 32)'));
+const reason = z.string().trim().min(1).max(200);
 
-const submitBody = z.object({
-  agentId,
-  recipient: address,
-  amount: usdcAmount,
-  memo: z.string().max(280).optional(),
-});
-
-const mandateBody = z.object({
-  name: z.string().min(1).max(80),
-  perPaymentLimit: usdcAmount,
+const terms = z.object({
+  perTxLimit: usdcAmount,
   dailyLimit: usdcAmount,
-  approvalThreshold: usdcAmount.nullable().default(null),
-  allowedRecipients: z.array(address).max(200).default([]),
-  walletAddress: address.nullable().default(null),
-  active: z.boolean().default(true),
+  currency: z.literal(CURRENCY).default(CURRENCY),
+  categories: z.array(category).min(1).max(50),
+  allowedRecipients: z.array(address).min(1).max(200).nullable().default(null),
+  payerAddress: address.nullable().default(null),
+  expiresAt: z.string().datetime({ offset: true }).transform((v) => new Date(v)),
 });
 
-const resolveBody = z.object({
-  action: z.enum(['approve', 'reject']),
-  actor: z
-    .string()
-    .min(1)
-    .max(40)
-    .regex(/^[a-zA-Z0-9_. @-]+$/, 'letters, digits, space and _ . @ - only')
-    .default('reviewer'),
+const createMandateBody = terms.extend({ agentId });
+const replaceBody = terms.extend({ reason: reason.default('replaced') });
+const revokeBody = z.object({ reason });
+
+const authorizeBody = z.object({
+  agentId,
+  amount: usdcAmount,
+  currency: z.string().min(1).max(16).default(CURRENCY),
+  recipient: address,
+  category,
 });
 
 const txBody = z.object({
   txHash: z.string().refine((v) => isHash(v), 'must be a 0x-prefixed 32-byte transaction hash'),
 });
 
-const verifyBody = z.object({
-  message: z.object({
-    requestId: z.string(),
-    agentId: z.string(),
-    token: address,
-    recipient: address,
-    amount: z.string(),
-    outcome: z.enum(['approved', 'denied', 'needs_approval']),
-    decidedBy: z.string(),
-    issuedAt: z.string(),
-  }),
-  signature: z.string().regex(/^0x[0-9a-fA-F]+$/, 'must be hex'),
+const sellerBody = z.object({
+  token: z.string().min(1),
+  expected: z.object({ amount: usdcAmount, currency: z.string().min(1), recipient: address }),
 });
 
-const listQuery = z.object({
-  status: z.enum(['approved', 'denied', 'needs_approval']).optional(),
+const decisionsQuery = z.object({
+  verdict: z.enum(['allow', 'deny']).optional(),
   agentId: z.string().optional(),
+  limit: z.coerce.number().int().min(1).max(500).optional(),
 });
 
 export interface AppOptions {
   corsOrigin?: string | boolean;
   logger?: boolean;
+  /** Nonce store for the demo seller endpoint. Defaults to an in-memory one. */
+  sellerNonces?: NonceStore;
+  now?: () => Date;
 }
 
 export function buildApp(service: MandateService, opts: AppOptions = {}): FastifyInstance {
   const app = Fastify({ logger: opts.logger ?? false });
+  const now = opts.now ?? (() => new Date());
+  const sellerNonces = opts.sellerNonces ?? new InMemoryNonceStore(() => Math.floor(now().getTime() / 1000));
 
   void app.register(cors, { origin: opts.corsOrigin ?? true });
 
@@ -113,95 +109,86 @@ export function buildApp(service: MandateService, opts: AppOptions = {}): Fastif
 
   app.get('/health', async () => ({ ok: true }));
 
-  /** Public info a receiving system needs to verify our decisions offline. */
-  app.get('/signer', async () => ({
-    address: service.signerAddress,
-    domain: DECISION_DOMAIN,
-    types: DECISION_TYPES,
-    primaryType: 'Decision',
-  }));
-
-  // ---- mandates ----
-
-  app.get('/summary', async () => {
-    const agents = service.agentSummaries().map(apiAgentSummary);
-    const sum = (f: (a: (typeof agents)[number]) => string) =>
-      formatUsdc(agents.reduce((acc, a) => acc + parseUsdc(f(a)), 0n));
-    return {
-      totals: {
-        pendingApprovals: agents.reduce((n, a) => n + a.pendingApprovals, 0),
-        spentTodayUsdc: sum((a) => a.spentTodayUsdc),
-        confirmedOnchainUsdc: sum((a) => a.confirmedOnchainUsdc),
-        mismatches: agents.reduce((n, a) => n + a.mismatches, 0),
-        pendingPayments: agents.reduce((n, a) => n + a.pendingPayments, 0),
-      },
-      agents,
-    };
+  /** The public keys a seller uses to verify verdicts. Cacheable: keys change rarely. */
+  app.get('/.well-known/jwks.json', async (_req, reply) => {
+    void reply.header('cache-control', 'public, max-age=300');
+    return service.jwks();
   });
 
-  app.put<{ Params: { agentId: string } }>('/mandates/:agentId', async (req) => {
-    const id = agentId.parse(req.params.agentId);
-    const body = mandateBody.parse(req.body);
-    if (body.perPaymentLimit > body.dailyLimit) {
-      throw new AppError(400, 'invalid_mandate', 'perPaymentLimit cannot exceed dailyLimit');
-    }
-    return apiMandate(service.upsertMandate({ agentId: id, ...body }));
+  // ---- mandates (immutable; change = revoke-and-replace) ----
+
+  app.post('/mandates', async (req, reply) => {
+    const { agentId: id, ...rest } = createMandateBody.parse(req.body);
+    const m = await service.createMandate(id, rest satisfies MandateTerms);
+    return reply.status(201).send(apiMandate(m, now()));
   });
 
-  // ---- requests ----
-
-  app.post('/requests', async (req, reply) => {
-    const body = submitBody.parse(req.body);
-    const { request, decision } = await service.submitRequest({ ...body, memo: body.memo ?? null });
-    return reply.status(201).send({
-      request: apiRequest(request),
-      decision: apiDecision(decision),
-    });
+  app.get('/mandates', async (req) => {
+    const q = z.object({ agentId: z.string().optional() }).parse(req.query);
+    return (await service.listMandates(q.agentId)).map((m) => apiMandate(m, now()));
   });
 
-  app.get('/requests', async (req) => {
-    const q = listQuery.parse(req.query);
-    return service.listRequests(q).map(({ request, payment }) => apiRequest(request, payment));
+  app.get<{ Params: { id: string } }>('/mandates/:id', async (req) => apiMandate(await service.getMandate(req.params.id), now()));
+
+  app.post<{ Params: { id: string } }>('/mandates/:id/replace', async (req, reply) => {
+    const { reason: why, ...rest } = replaceBody.parse(req.body);
+    return reply.status(201).send(apiMandate(await service.replaceMandate(req.params.id, rest, why), now()));
   });
 
-  app.get<{ Params: { id: string } }>('/requests/:id', async (req) => apiDetail(service.getRequestDetail(req.params.id)));
-
-  app.post<{ Params: { id: string } }>('/requests/:id/resolve', async (req) => {
-    const body = resolveBody.parse(req.body);
-    const { request, decision } = await service.resolveRequest(req.params.id, body.action, body.actor);
-    return { request: apiRequest(request), decision: apiDecision(decision) };
+  app.post<{ Params: { id: string } }>('/mandates/:id/revoke', async (req) => {
+    const { reason: why } = revokeBody.parse(req.body);
+    return apiMandate(await service.revokeMandate(req.params.id, why), now());
   });
 
-  app.get('/decisions', async () => service.recentDecisions().map(apiDecision));
-
-  // ---- onchain tracing ----
-
-  app.post<{ Params: { id: string } }>('/requests/:id/payment', async (req, reply) => {
-    const body = txBody.parse(req.body);
-    const payment = await service.attachPayment(req.params.id, body.txHash as Hash);
-    return reply.status(201).send(apiPayment(payment));
-  });
-
-  app.post<{ Params: { id: string } }>('/requests/:id/payment/recheck', async (req) =>
-    apiPayment(await service.recheckPayment(req.params.id)),
-  );
-
-  // ---- verification ----
+  // ---- authorization ----
 
   /**
-   * Check that a decision was really signed by this server and hasn't been altered.
-   * Always 200: the answer is in `valid`.
+   * The agent's call. Always 200 when the request was well-formed: a deny is a successful
+   * answer, not an error. The body carries the verdict, the reason, and the signed JWT.
    */
-  app.post('/verify', async (req) => {
-    const body = verifyBody.parse(req.body);
-    let message;
-    try {
-      message = fromWire(body.message);
-    } catch (e) {
-      return { valid: false, signer: service.signerAddress, reason: (e as Error).message };
-    }
-    const valid = await verifyDecision(message, body.signature as Hex, service.signerAddress);
-    return { valid, signer: service.signerAddress };
+  app.post('/authorize', async (req) => {
+    const body = authorizeBody.parse(req.body);
+    return apiDecision(await service.authorize(body));
+  });
+
+  app.get('/decisions', async (req) => {
+    const q = decisionsQuery.parse(req.query);
+    return (await service.listDecisions(q)).map(apiDecisionListItem);
+  });
+
+  app.get<{ Params: { id: string } }>('/decisions/:id', async (req) => apiDetail(await service.getDecisionDetail(req.params.id), now()));
+
+  // ---- onchain reconciliation ----
+
+  app.post<{ Params: { id: string } }>('/decisions/:id/payment', async (req, reply) => {
+    const body = txBody.parse(req.body);
+    return reply.status(201).send(apiRecon(await service.attachPayment(req.params.id, body.txHash as Hash)));
+  });
+
+  app.post<{ Params: { id: string } }>('/decisions/:id/payment/recheck', async (req) =>
+    apiRecon(await service.recheckPayment(req.params.id)),
+  );
+
+  // ---- dashboard ----
+
+  app.get('/summary', async () => apiSummary(await service.summary(), now()));
+
+  // ---- demo seller ----
+
+  /**
+   * A SIMULATED seller, for the demo UI. It runs the same `verifyVerdict` a real seller would,
+   * with the issuer's public keys and its own nonce store, so you can watch a replay get rejected.
+   * Always 200: the answer is in `ok`. A real seller runs the verifier in its own process.
+   */
+  app.post('/demo/seller/verify', async (req) => {
+    const { token, expected } = sellerBody.parse(req.body);
+    const result = await verifyVerdict(token, expected, {
+      keys: createLocalJWKSet(service.jwks()),
+      issuer: service.issuer,
+      nonces: sellerNonces,
+      now: now(),
+    });
+    return result.ok ? { ok: true, claims: result.claims } : result;
   });
 
   return app;

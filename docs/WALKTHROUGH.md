@@ -1,67 +1,72 @@
 # Walkthrough: know every file
 
-## The three core modules (`server/src/`)
+## The core modules (`server/src/`)
 
-**`policy.ts`: the decision.** One pure function, `evaluatePolicy(request, mandate, spentToday)`. No database, no clock, no network: that's *why* it's easy to test and why the tests are exhaustive. Two tiers: hard rules deny, soft rules escalate. `checkHardRules` reuses it when a human approves, so a human can't approve past a limit.
+**`policy.ts`: the decision.** One pure function, `evaluatePolicy(request, mandate, spentToday, now)`. No database, no clock, no network, which is why it is exhaustively testable. Nine checks in a fixed order; the first failure is the single reason. Limits are inclusive; a mandate is expired from the instant `now >= expiresAt`.
 
-**`signing.ts`: the receipt for the decision.** Defines an EIP-712 domain + `Decision` type and wraps viem's `signTypedData` / `verifyTypedData`. `toWire`/`fromWire` convert `uint256` fields between `bigint` and JSON-safe strings. A verifier needs only the signer's *address*.
+**`verdict.ts` + `keys.ts`: the signed answer.** `signVerdict` builds the claims and signs them with `jose`'s `SignJWT` (ES256, `kid`, `typ: mandate-verdict+jwt`, `exp = iat + 300`, a 128-bit random `nonce`, `jti` = the decision id). `KeyRing` holds the active private key plus retired *public* keys, and publishes them as a JWKS. The `kid` is the RFC 7638 thumbprint of the public key. `amount` is a base-unit *string*, never a JSON number.
 
-**`tracing.ts`: the link to the chain.** `traceTransfer(client, txHash, expected)`:
-1. `getTransactionReceipt`; "not found" → `pending`, any other RPC error is rethrown (not a verdict).
-2. `status === 'reverted'` → `mismatch`.
-3. `parseEventLogs({ abi: erc20Abi, eventName: 'Transfer', logs })`, then **filter by emitting contract address**.
-4. Any transfer with the right `to`, exact `value` (and `from`, if known) → `confirmed`; otherwise `mismatch` with the most specific reason.
+**`verifier.ts`: what a seller runs.** `verifyVerdict(token, expected, { keys, issuer, nonces })`. It imports nothing from the database. Order of checks: signature and header (`alg` pinned to ES256, `typ`, issuer, expiry) → verdict is `allow` → amount (bigint), currency, recipient (and optional chain/token) match what the seller expects → **only then** consume the nonce. `NonceStore.consume` must be atomic; the in-memory one is for a single process.
 
-## Supporting server files
+**`reconcile.ts`: the link to the chain.** `reconcileTransfer(client, txHash, expected)`: `getTransactionReceipt` (not found → `pending`; other RPC errors are rethrown, because a network error is not a verdict) → reverted is `mismatch` → `parseEventLogs({ abi: erc20Abi, eventName: 'Transfer' })` → **filter by emitting contract address** → look for a transfer with the exact recipient and amount (and sender, if known) → `matched`, else `mismatch` with the most specific reason.
+
+## Persistence and orchestration
 
 | File | What it does |
 | --- | --- |
-| `types.ts`, `units.ts` | Domain types; `parseUsdc`/`formatUsdc` (6-decimal bigint money), `utcDayStart` |
-| `db.ts` | Opens SQLite (`node:sqlite`, loaded via `createRequire` because Vite doesn't recognise the builtin) and defines the schema |
-| `store.ts` | Synchronous data-access layer; `transaction()` wraps `BEGIN IMMEDIATE … COMMIT` |
-| `service.ts` | Orchestration: submit → evaluate → persist → sign; resolve; attach/recheck payment; summaries. Owns the "no `await` between check and insert" guarantee |
-| `serialize.ts` | bigint → JSON shapes (`amount` exact, `amountUsdc` for display) |
-| `app.ts` | Fastify routes, zod validation, error mapping (`AppError` → HTTP status) |
-| `config.ts`, `index.ts` | Env loading (dev key file, required key in production); wiring |
-| `seed.ts`, `scripts/` | Demo data; `gen-key`; `send-usdc` (real testnet transfer via `writeContract`) |
+| `schema.ts` | The Postgres schema, idempotent. `NUMERIC(78,0)` money (wide enough for a uint256). Append-only triggers on four tables. Partial unique indexes so a transaction or a decision can only be `matched` once |
+| `db.ts` | A tiny `Db` interface with two adapters: `pg` (a real server) and PGlite (Postgres in WebAssembly). One set of SQL for both. `transaction()` is BEGIN/COMMIT/ROLLBACK |
+| `repo.ts` | All SQL. Numerics are cast to text and read back as `bigint` |
+| `service.ts` | Orchestration: mandates (create/replace/revoke), `authorize`, decision detail and trail, reconciliation, summary. Owns the locking |
+| `app.ts` | Fastify routes, zod validation, error mapping (`AppError` to HTTP status), and the *demo* seller endpoint |
+| `serialize.ts` | bigint to JSON shapes (`amount` exact, `amountUsdc` for display) |
+| `config.ts`, `bootstrap.ts`, `index.ts` | Env loading (dev key file; key required in production), wiring |
+| `mcp.ts`, `scripts/mcp.ts` | The `request_spend` MCP tool, and its stdio entry point |
+| `seed.ts`, `scripts/` | Demo data through the real service; `gen-key`; `send-usdc` (a real testnet transfer via viem) |
 
 ## Data model
 
-`mandates` → `requests` (status: approved / denied / needs_approval) → `decisions` (one per signed decision; a queued request gets two: policy, then human) → `payments` (one per request, `tx_hash UNIQUE`) and `audit_events` (append-only timeline).
+`mandates` (immutable, one row per version) ← `mandate_revocations` (one row per revoked mandate, `replaced_by` points at the next version) · `decision_log` (every verdict, allow and deny, with its token and claims) → `reconciliations` (every onchain check; the current status is the latest row).
 
 ## Frontend (`web/src/`)
 
-`api.ts` (typed fetch + a `usePoll` hook) · `App.tsx` (hash router, nav) · `pages/Dashboard` · `Approvals` (queue + decision log + Verify buttons) · `Requests` (list; detail with audit trail and the transaction-tracing panel) · `Simulator` (plays the agent). `ui.tsx` holds shared bits like the exact `formatBaseUnits`.
+`api.ts` (typed fetch + a `usePoll` hook) · `App.tsx` (hash router) · `pages/Dashboard` (spend per agent, awaiting payment, recent approvals) · `Decisions` (log, and a detail page with the request-to-transaction trail and the reconcile panel) · `Mandates` (versions, revoke, replace, create) · `Simulator` (play the agent, then play the seller and watch a replay get rejected).
 
-## Questions
+## Questions 
 
-**"Why EIP-712 instead of signing a JSON string?"**
-Canonical encoding (no key-order/whitespace ambiguity), a domain separator that prevents cross-app replay, and wallets/tools can render the fields. The cost is you must agree on the type definition, which `/signer` publishes.
+**"Why a JWT and not just an API response?"**
+The seller is a different party. A signed, self-contained token lets the seller verify *offline* that the verdict is ours and unaltered, without calling us per payment. The cost is that revocation and expiry must be designed in: hence the five-minute `exp` and the nonce.
 
-**"What's in your signed message, and what's *not*?"**
-Request id, agent, token, recipient, amount, outcome, who decided, timestamp. The reasons aren't signed; the outcome is what a receiver acts on. (Reasonable follow-up: you could sign a hash of the policy version too.)
+**"Why ES256 and a JWKS?"**
+Asymmetric: sellers only ever hold public keys, so a compromised seller cannot mint verdicts (it could with an HS256 shared secret). The JWKS lets sellers fetch and cache keys, and the `kid` selects the right one, which is what makes rotation possible: keep the old public key published until old verdicts expire.
 
-**"How do you know a transaction paid the right thing?"**
-Decode the receipt's `Transfer` logs, keep only logs emitted by the USDC contract, require exact `value` and matching `to` (and `from` if the mandate names a wallet). Checking the contract address matters because `parseEventLogs` only matches the event *signature*: a malicious contract can emit a lookalike.
+**"What stops a replay?"**
+The `nonce` claim plus the seller's nonce store: the first presentation consumes it, the second is rejected. The expiry bounds how long the store must remember it. Two subtleties worth knowing: consume the nonce *last* (a verification that fails for another reason must not burn a good token), and `consume` must be atomic (a test fires concurrent presentations; exactly one wins).
 
-**"Why is a reverted transaction a mismatch and not an error?"**
-It *is* a definite answer: the tx was mined and no funds moved. A network failure is different: that's a `502` and nothing is recorded.
+**"What attacks does the verifier defend against?"**
+`alg: none`, algorithm confusion (HS256 signed with the public key as secret), tokens that are validly signed but are not verdicts (`typ`), a verdict from the wrong issuer, edited payloads, a denied verdict with a flipped `verdict` claim, a token signed by a different key claiming our `kid`.
+
+**"Why are amounts strings in the JWT?"**
+JSON numbers are doubles; USDC amounts are 6-decimal integers that must be exact. The verifier compares `BigInt(claim) === expected` so one base unit off is rejected and `"10"` vs `"10.0"` cannot slip through.
+
+**"How do mandates stay immutable?"**
+Rows are never updated: a revocation is a separate row. The database enforces it with triggers that reject `UPDATE`, `DELETE` and `TRUNCATE`, and tests assert this with raw SQL. Be honest about the limit: a table owner can drop a trigger, so production hardening is a database role with only `INSERT` and `SELECT`.
 
 **"Could two requests race past the daily limit?"**
-Not in this design: the spend read and the insert run in one synchronous SQLite transaction with no `await` between. There's a test that fires six concurrent requests. With multiple servers or an async DB you'd need a row lock or a constraint (e.g. `SELECT … FOR UPDATE`, or a serializable transaction).
+No. `authorize` runs in one transaction that first takes `SELECT … FOR UPDATE` on the agent's current mandate row, then sums today's allowed spend. A concurrent request for the same agent waits on that lock, and under READ COMMITTED its later `SUM` statement sees the first request's committed row. A test fires six concurrent requests. The same property is verified on real Postgres, not only PGlite.
 
-**"Can a human approve anything?"**
-No. Soft rules (unknown recipient, above threshold) are exactly what a human may override. Hard limits are re-checked at approval time against current spend.
+**"What does replacing a mandate do to today's spend?"**
+Nothing: the daily budget is summed per agent across mandate versions. A human raising the limit does not get a free reset, and tightening it takes effect immediately.
 
-**"What happens if the same tx hash is submitted twice?"**
-`tx_hash` is `UNIQUE`, and the service checks it before and again inside the save transaction. One transfer can't justify two payments.
+**"How do you know a transaction paid the right thing?"**
+Decode the receipt's `Transfer` logs, keep only logs emitted by the verdict's USDC contract (`parseEventLogs` matches the event signature only, so a lookalike token's `Transfer` would otherwise count), and require the exact recipient and amount, compared as `bigint`. The source of truth is the **verdict**, not the mandate as it is today.
 
-**"What does `confirmed` mean? Is it final?"**
-Mined with a successful receipt and a matching transfer. It does *not* wait for confirmation depth, and doesn't handle reorgs. On an L2 like Base that's a reasonable demo shortcut, not a production guarantee.
+**"What if the same transaction is submitted twice, or for two payments?"**
+Partial unique indexes on `reconciliations`: one `matched` row per `tx_hash` and one per decision. The service checks first and again inside the transaction; the index is the backstop for a race (a test attempts two concurrent matches; one wins).
+
+**"Is `matched` final?"**
+No: mined with a successful receipt and a matching log. No confirmation depth or reorg handling, and it does not check the transfer happened within the verdict's five minutes (a test documents that it still reconciles after expiry). On an L2 and a testnet that is a reasonable shortcut; it is not a production guarantee.
 
 **"What would you build next?"**
-Per-agent auth; make the executor require a valid signed decision (that's the point of signing); confirmation depth; expose `request_spend` as an MCP tool so an agent can call it directly.
-
-## Things to be honest about
-
+Per-agent authentication; idempotency keys on `/authorize`; make a payment executor *require* a valid verdict before releasing funds; bound reconciliation by time and confirmation depth; a shared nonce store (Redis `SET NX EX`); an escrow state tracker.
 

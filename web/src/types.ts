@@ -1,107 +1,122 @@
 // Mirrors the JSON the API returns (see server/src/serialize.ts).
-// Money arrives as human decimal strings (`...Usdc`) and, for requests, exact base units (`amount`).
+// Money arrives as exact base units (`amount`) and a decimal string for display (`...Usdc`).
+// Times are epoch milliseconds.
 
-export type Outcome = 'approved' | 'denied' | 'needs_approval';
-export type PaymentStatus = 'pending' | 'confirmed' | 'mismatch';
+export type Verdict = 'allow' | 'deny';
+export type ReconStatus = 'pending' | 'matched' | 'mismatch';
+export type MandateStatus = 'active' | 'expired' | 'revoked' | 'replaced';
 
-export interface Reason {
-  code: string;
-  message: string;
-}
-
-export interface Payment {
-  txHash: string;
-  status: PaymentStatus;
-  blockNumber: string | null;
-  reason: string | null;
-  detail: string | null;
-  actualFrom: string | null;
-  actualRecipient: string | null;
-  actualAmountUsdc: string | null;
-  explorerUrl: string;
-  createdAt: number;
-  checkedAt: number | null;
-}
-
-export interface SpendRequest {
+export interface Mandate {
   id: string;
   agentId: string;
-  recipient: string;
-  amount: string;
-  amountUsdc: string;
-  memo: string | null;
-  status: Outcome;
+  version: number;
+  status: MandateStatus;
+  perTxLimitUsdc: string;
+  dailyLimitUsdc: string;
+  currency: string;
+  categories: string[];
+  /** null = any recipient. */
+  allowedRecipients: string[] | null;
+  payerAddress: string | null;
+  expiresAt: number;
   createdAt: number;
-  decidedAt: number | null;
-  payment: Payment | null;
+  revokedAt: number | null;
+  revokeReason: string | null;
+  replacedBy: string | null;
 }
 
-export interface WireDecision {
-  requestId: string;
-  agentId: string;
-  token: string;
-  recipient: string;
-  amount: string;
-  outcome: Outcome;
-  decidedBy: string;
-  issuedAt: string;
+export interface Recon {
+  txHash: string;
+  status: ReconStatus;
+  reason: string | null;
+  detail: string | null;
+  blockNumber: string | null;
+  actualFrom: string | null;
+  actualRecipient: string | null;
+  actualAmount: string | null;
+  actualAmountUsdc: string | null;
+  explorerUrl: string;
+  checkedAt: number;
 }
 
 export interface Decision {
-  id: number;
-  requestId: string;
-  outcome: Outcome;
-  decidedBy: string;
-  reasons: Reason[];
-  message: WireDecision;
-  signature: string;
-  signer: string;
-  createdAt: number;
-}
-
-export interface AuditEvent {
-  id: number;
-  requestId: string;
-  type: string;
-  detail: Record<string, unknown>;
-  at: number;
-}
-
-export interface Mandate {
+  id: string;
   agentId: string;
-  name: string;
-  perPaymentLimitUsdc: string;
-  dailyLimitUsdc: string;
-  approvalThresholdUsdc: string | null;
-  allowedRecipients: string[];
-  walletAddress: string | null;
-  active: boolean;
+  verdict: Verdict;
+  reasonCode: string | null;
+  reason: string;
+  amount: string;
+  amountUsdc: string;
+  currency: string;
+  recipient: string;
+  category: string;
+  mandateId: string | null;
+  mandateVersion: number | null;
+  nonce: string;
+  /** The signed verdict (ES256 JWT). */
+  token: string;
+  claims: Record<string, unknown>;
+  issuedAt: number;
+  expiresAt: number;
+  createdAt: number;
+  payment: Recon | null;
 }
 
-export interface AgentSummary extends Mandate {
-  spentTodayUsdc: string;
+export interface TrailEvent {
+  at: number;
+  type:
+    | 'authorization_requested'
+    | 'verdict_issued'
+    | 'reconciliation_pending'
+    | 'reconciliation_matched'
+    | 'reconciliation_mismatch';
+  detail: Record<string, unknown>;
+}
+
+export interface DecisionDetail {
+  decision: Decision;
+  mandate: Mandate | null;
+  reconciliations: Recon[];
+  trail: TrailEvent[];
+}
+
+export interface AgentSummary {
+  agentId: string;
+  mandate: Mandate;
+  allowedTodayUsdc: string;
   remainingTodayUsdc: string;
-  pendingApprovals: number;
-  requestCounts: Record<Outcome, number>;
-  confirmedOnchainUsdc: string;
-  mismatches: number;
-  pendingPayments: number;
+  allowCount: number;
+  denyCount: number;
+  awaitingPaymentCount: number;
+  matchedUsdc: string;
+  matchedCount: number;
+  mismatchCount: number;
+  pendingCount: number;
 }
 
 export interface Summary {
   totals: {
-    pendingApprovals: number;
-    spentTodayUsdc: string;
-    confirmedOnchainUsdc: string;
-    mismatches: number;
-    pendingPayments: number;
+    allowedTodayUsdc: string;
+    matchedUsdc: string;
+    allowCount: number;
+    denyCount: number;
+    awaitingPaymentCount: number;
+    pendingCount: number;
+    mismatchCount: number;
   };
   agents: AgentSummary[];
 }
 
-export interface RequestDetail {
-  request: SpendRequest;
-  mandate: Mandate | null;
-  decisions: Decision[];
-  events: AuditEvent[];
+export type SellerResult =
+  | { ok: true; claims: Record<string, unknown> }
+  | { ok: false; code: string; message: string };
+
+/** The terms of a mandate as the create/replace forms send them. */
+export interface MandateTermsInput {
+  perTxLimit: string;
+  dailyLimit: string;
+  categories: string[];
+  allowedRecipients: string[] | null;
+  payerAddress: string | null;
+  expiresAt: string;
 }

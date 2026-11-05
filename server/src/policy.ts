@@ -1,100 +1,66 @@
-import type { Mandate, PolicyResult, Reason, SpendRequestInput } from './types';
+import type { AuthorizeInput, MandateRecord, PolicyResult, ReasonCode } from './types';
 import { formatUsdc } from './units';
 
 /**
- * The policy engine. A pure function: no I/O, no clock, no database.
- * The caller supplies how much the agent has already spent today.
+ * The policy engine: a pure function. No I/O, no clock, no database. The caller supplies the
+ * agent's current mandate, how much it has already been allowed today, and the time.
  *
- * Rules, in two tiers:
+ * Checks run in this fixed order and the FIRST failure is the single reason returned. A fixed
+ * order makes the answer deterministic and easy to test and explain:
  *
- *  HARD rules -> `denied` (a human cannot override these through the queue)
- *    - amount must be > 0
- *    - the agent must have an active mandate
- *    - amount <= perPaymentLimit
- *    - spentToday + amount <= dailyLimit
+ *   1. amount > 0                    invalid_amount
+ *   2. a mandate exists              no_mandate
+ *   3. it is not revoked             mandate_revoked
+ *   4. it has not expired            mandate_expired
+ *   5. currency matches              currency_mismatch
+ *   6. category is allowed           category_not_allowed
+ *   7. recipient is allowed          recipient_not_allowed   (only if the mandate lists recipients)
+ *   8. amount <= per-transaction     exceeds_per_tx_limit
+ *   9. spentToday + amount <= daily  exceeds_daily_limit
  *
- *  SOFT rules -> `needs_approval` (a human decides)
- *    - recipient is not on the allowlist (an empty allowlist means "everyone needs approval")
- *    - amount > approvalThreshold (when one is set)
- *
- * If any hard rule fails the result is `denied`, and every failing hard rule is reported.
- * Otherwise, if any soft rule fires the result is `needs_approval`. Otherwise `approved`.
+ * Limits are inclusive: spending exactly the limit is allowed. A mandate is expired from the
+ * instant `now >= expiresAt`.
  */
 export function evaluatePolicy(
-  request: SpendRequestInput,
-  mandate: Mandate | null,
+  request: AuthorizeInput,
+  mandate: MandateRecord | null,
   spentToday: bigint,
+  now: Date,
 ): PolicyResult {
-  if (mandate === null) {
-    return deny([{ code: 'no_mandate', message: 'No mandate exists for this agent' }]);
+  if (request.amount <= 0n) return deny('invalid_amount', 'Amount must be greater than zero');
+  if (!mandate) return deny('no_mandate', 'This agent has no mandate');
+  if (mandate.revokedAt) {
+    return deny('mandate_revoked', `Mandate v${mandate.version} was revoked: ${mandate.revokeReason ?? 'no reason given'}`);
   }
-  if (!mandate.active) {
-    return deny([{ code: 'mandate_inactive', message: 'This agent’s mandate is paused' }]);
+  if (now.getTime() >= mandate.expiresAt.getTime()) {
+    return deny('mandate_expired', `Mandate v${mandate.version} expired at ${mandate.expiresAt.toISOString()}`);
   }
-  if (request.amount <= 0n) {
-    return deny([{ code: 'invalid_amount', message: 'Amount must be greater than zero' }]);
+  if (request.currency !== mandate.currency) {
+    return deny('currency_mismatch', `Mandate is denominated in ${mandate.currency}, not ${request.currency}`);
   }
-
-  const denials: Reason[] = [];
-
-  if (request.amount > mandate.perPaymentLimit) {
-    denials.push({
-      code: 'exceeds_per_payment_limit',
-      message: `${formatUsdc(request.amount)} USDC exceeds the per-payment limit of ${formatUsdc(mandate.perPaymentLimit)} USDC`,
-    });
+  if (!mandate.categories.includes(request.category)) {
+    return deny('category_not_allowed', `Category "${request.category}" is not allowed (allowed: ${mandate.categories.join(', ')})`);
   }
-
+  if (mandate.allowedRecipients && !mandate.allowedRecipients.some((a) => sameAddress(a, request.recipient))) {
+    return deny('recipient_not_allowed', `Recipient ${request.recipient} is not on the mandate's allowlist`);
+  }
+  if (request.amount > mandate.perTxLimit) {
+    return deny('exceeds_per_tx_limit', `${formatUsdc(request.amount)} USDC exceeds the per-transaction limit of ${formatUsdc(mandate.perTxLimit)} USDC`);
+  }
   if (spentToday + request.amount > mandate.dailyLimit) {
-    const remaining = mandate.dailyLimit > spentToday ? mandate.dailyLimit - spentToday : 0n;
-    denials.push({
-      code: 'exceeds_daily_limit',
-      message: `${formatUsdc(request.amount)} USDC would exceed the daily limit of ${formatUsdc(mandate.dailyLimit)} USDC (${formatUsdc(remaining)} USDC left today)`,
-    });
+    const left = mandate.dailyLimit > spentToday ? mandate.dailyLimit - spentToday : 0n;
+    return deny(
+      'exceeds_daily_limit',
+      `${formatUsdc(request.amount)} USDC would exceed the daily limit of ${formatUsdc(mandate.dailyLimit)} USDC (${formatUsdc(left)} USDC left today)`,
+    );
   }
-
-  if (denials.length > 0) return deny(denials);
-
-  const escalations: Reason[] = [];
-
-  if (!isAllowedRecipient(mandate, request.recipient)) {
-    escalations.push({
-      code: 'recipient_not_allowed',
-      message: `Recipient ${request.recipient} is not on the allowlist`,
-    });
-  }
-
-  if (mandate.approvalThreshold !== null && request.amount > mandate.approvalThreshold) {
-    escalations.push({
-      code: 'above_approval_threshold',
-      message: `${formatUsdc(request.amount)} USDC is above the auto-approval threshold of ${formatUsdc(mandate.approvalThreshold)} USDC`,
-    });
-  }
-
-  if (escalations.length > 0) return { outcome: 'needs_approval', reasons: escalations };
-
-  return { outcome: 'approved', reasons: [] };
+  return { verdict: 'allow', code: null, reason: 'Within mandate' };
 }
 
-/**
- * Re-check only the hard rules. Used when a human approves a queued request: the world may
- * have changed since it was queued (other spend landed, the mandate was tightened), and a
- * human clicking "approve" should not be able to blow through a hard limit.
- * Returns the denial reasons, or an empty array if the hard rules still pass.
- */
-export function checkHardRules(
-  request: SpendRequestInput,
-  mandate: Mandate | null,
-  spentToday: bigint,
-): Reason[] {
-  const result = evaluatePolicy(request, mandate, spentToday);
-  return result.outcome === 'denied' ? result.reasons : [];
+function deny(code: ReasonCode, reason: string): PolicyResult {
+  return { verdict: 'deny', code, reason };
 }
 
-export function isAllowedRecipient(mandate: Mandate, recipient: string): boolean {
-  const target = recipient.toLowerCase();
-  return mandate.allowedRecipients.some((a) => a.toLowerCase() === target);
-}
-
-function deny(reasons: Reason[]): PolicyResult {
-  return { outcome: 'denied', reasons };
+function sameAddress(a: string, b: string): boolean {
+  return a.toLowerCase() === b.toLowerCase();
 }

@@ -1,52 +1,75 @@
 import type { Address } from 'viem';
 
-/** What the policy engine (or a human) decided about a spend request. */
-export type Outcome = 'approved' | 'denied' | 'needs_approval';
+export const CURRENCY = 'USDC';
+export type Currency = typeof CURRENCY;
 
-/** Onchain tracing status of an approved payment. */
-export type PaymentStatus = 'pending' | 'confirmed' | 'mismatch';
+/** What the authorization endpoint answers. */
+export type Verdict = 'allow' | 'deny';
 
-/**
- * A human-defined spending policy for one agent.
- * All amounts are USDC base units (6 decimals) as bigint.
- */
-export interface Mandate {
-  agentId: string;
-  name: string;
-  /** Hard cap for a single payment. Above this, the request is denied. */
-  perPaymentLimit: bigint;
-  /** Hard cap on approved spend per UTC day. Above this, the request is denied. */
+/** Where an allowed payment stands onchain. */
+export type ReconStatus = 'pending' | 'matched' | 'mismatch';
+
+/** The terms of a mandate. All amounts are USDC base units (6 decimals) as bigint. */
+export interface MandateTerms {
+  /** Cap for a single payment. */
+  perTxLimit: bigint;
+  /** Cap on allowed spend per UTC day, across every mandate version of the agent. */
   dailyLimit: bigint;
-  /** Soft cap. Above this (but within hard limits), a human must approve. null = no threshold. */
-  approvalThreshold: bigint | null;
-  /** Recipients the agent may pay without a human. Anyone else needs approval. */
-  allowedRecipients: Address[];
-  /** Optional: the wallet the agent pays from. If set, onchain tracing also checks `from`. */
-  walletAddress: Address | null;
-  active: boolean;
+  currency: Currency;
+  /** Spend categories the agent may use (lowercase). */
+  categories: string[];
+  /** Recipients the agent may pay. null = any recipient. Never an empty array. */
+  allowedRecipients: Address[] | null;
+  /** Optional: the wallet the agent pays from. When set, reconciliation also checks the sender. */
+  payerAddress: Address | null;
+  expiresAt: Date;
 }
 
-export interface SpendRequestInput {
+/** One immutable mandate record. Changing terms means revoking this one and creating the next version. */
+export interface Mandate extends MandateTerms {
+  id: string;
+  agentId: string;
+  /** 1, 2, 3… per agent. The highest version is the agent's current mandate. */
+  version: number;
+  createdAt: Date;
+}
+
+/** A mandate plus its revocation, which lives in a separate append-only table. */
+export interface MandateRecord extends Mandate {
+  revokedAt: Date | null;
+  revokeReason: string | null;
+  replacedBy: string | null;
+}
+
+export type MandateStatus = 'active' | 'expired' | 'revoked' | 'replaced';
+
+export function mandateStatus(m: MandateRecord, now: Date): MandateStatus {
+  if (m.revokedAt) return m.replacedBy ? 'replaced' : 'revoked';
+  return now.getTime() >= m.expiresAt.getTime() ? 'expired' : 'active';
+}
+
+export interface AuthorizeInput {
+  agentId: string;
   amount: bigint;
+  currency: string;
   recipient: Address;
+  category: string;
 }
 
 export type ReasonCode =
   | 'invalid_amount'
   | 'no_mandate'
-  | 'mandate_inactive'
-  | 'exceeds_per_payment_limit'
-  | 'exceeds_daily_limit'
+  | 'mandate_revoked'
+  | 'mandate_expired'
+  | 'currency_mismatch'
+  | 'category_not_allowed'
   | 'recipient_not_allowed'
-  | 'above_approval_threshold'
-  | 'rejected_by_human';
-
-export interface Reason {
-  code: ReasonCode;
-  message: string;
-}
+  | 'exceeds_per_tx_limit'
+  | 'exceeds_daily_limit';
 
 export interface PolicyResult {
-  outcome: Outcome;
-  reasons: Reason[];
+  verdict: Verdict;
+  /** null when allowed. */
+  code: ReasonCode | null;
+  reason: string;
 }

@@ -1,6 +1,7 @@
-import { generatePrivateKey, privateKeyToAccount } from 'viem/accounts';
+import { KeyRing } from '../src/keys';
 
-const key = generatePrivateKey();
-console.log(`SIGNER_PRIVATE_KEY=${key}`);
-console.log(`# signer address: ${privateKeyToAccount(key).address}`);
-console.log('# Put the first line in server/.env. This key only signs decisions; it never needs funds.');
+const keys = await KeyRing.generate();
+console.log(`SIGNING_KEY_JWK='${JSON.stringify(keys.exportPrivateJwk())}'`);
+console.log(`# kid: ${keys.kid}`);
+console.log('# Put the first line in server/.env (or your host\'s secret store). It is a SECRET: it signs verdicts.');
+console.log('# It never needs funds. The matching public key is served at /.well-known/jwks.json.');

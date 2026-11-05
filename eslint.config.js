@@ -19,7 +19,8 @@ export default tseslint.config(
   },
   {
     rules: {
-      '@typescript-eslint/no-unused-vars': ['error', { argsIgnorePattern: '^_' }],
+      // ignoreRestSiblings: `const { d, ...pub } = jwk` is how private key material is stripped.
+      '@typescript-eslint/no-unused-vars': ['error', { argsIgnorePattern: '^_', ignoreRestSiblings: true }],
     },
   },
 );
